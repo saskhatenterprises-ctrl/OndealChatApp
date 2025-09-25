@@ -11,8 +11,19 @@ const app = express();
 // Middleware
 app.use(express.json());
 app.use(cookieParser());
+const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:3000')
+  .split(',')   // allow multiple if provided like: "http://localhost:3000,https://ondeal-chat-app.vercel.app"
+  .map(origin => origin.trim());
+
 app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:3000',
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true); // allow server-to-server or curl
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`❌ Not allowed by CORS: ${origin}`));
+    }
+  },
   credentials: true
 }));
 
@@ -403,4 +414,3 @@ app.listen(PORT, () => {
   console.log(`🔑 JWT Secret: ${process.env.JWT_SECRET ? 'configured' : 'using default (INSECURE!)'}`);
   console.log(`📊 MongoDB URI: ${process.env.MONGO_URI ? 'configured' : 'NOT CONFIGURED!'}`);
 });
-
