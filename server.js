@@ -442,7 +442,9 @@ app.post('/login', async (req, res) => {
         id: user._id, 
         username: user.username, 
         email, 
-        gender: user.gender 
+        gender: user.gender,
+        token // add this
+
       }
     });
   } catch (error) {
