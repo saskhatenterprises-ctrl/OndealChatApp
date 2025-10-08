@@ -11,7 +11,6 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
-// Middleware
 app.use(express.json());
 app.use(cookieParser());
 
@@ -43,7 +42,6 @@ const io = new Server(server, {
 // MongoDB connection with improved error handling
 const connectDB = async () => {
   try {
-    // Accept both MONGO_URI and MONGODB_URI for flexibility
     const mongoURI = process.env.MONGO_URI || process.env.MONGODB_URI;
     
     if (!mongoURI) {
@@ -113,26 +111,29 @@ const userSchema = new mongoose.Schema({
     required: true, 
     unique: true, 
     trim: true, 
-    minlength: 3, 
+    minlength: 2, 
     maxlength: 30 
   },
   email: { 
     type: String, 
-    required: true, 
-    unique: true, 
+    unique: true,
+    sparse: true, // Allow null values for anonymous users
     lowercase: true, 
     trim: true, 
     match: [/^\w+([.-]?\w+)*@\w+([.-]?\w+)*(\.\w{2,3})+$/, 'Please enter a valid email'] 
   },
   password: { 
     type: String, 
-    required: true, 
     minlength: 6 
   },
   gender: { 
     type: String, 
     required: true, 
     enum: ['male', 'female', 'other', 'trans', 'prefer-not-to-say'] 
+  },
+  isAnonymous: {
+    type: Boolean,
+    default: false
   },
   tokenVersion: {
     type: Number,
@@ -146,6 +147,12 @@ const userSchema = new mongoose.Schema({
 
 userSchema.pre('save', async function(next) {
   if (!this.isModified('password')) return next();
+  
+  // Skip password hashing for anonymous users without password
+  if (this.isAnonymous && !this.password) {
+    return next();
+  }
+  
   try {
     const salt = await bcrypt.genSalt(12);
     this.password = await bcrypt.hash(this.password, salt);
@@ -156,6 +163,7 @@ userSchema.pre('save', async function(next) {
 });
 
 userSchema.methods.comparePassword = async function(candidatePassword) {
+  if (!this.password) return false;
   return bcrypt.compare(candidatePassword, this.password);
 };
 
@@ -346,6 +354,7 @@ app.get('/', (req, res) => {
     endpoints: {
       health: '/health',
       signup: 'POST /signup',
+      anonymousSignup: 'POST /anonymous-signup',
       login: 'POST /login',
       logout: 'POST /logout',
       profile: 'GET /me',
@@ -355,6 +364,90 @@ app.get('/', (req, res) => {
       sendMessage: 'POST /messages'
     }
   });
+});
+
+// Anonymous Signup Route
+app.post('/anonymous-signup', async (req, res) => {
+  try {
+    const { username, gender, isAnonymous } = req.body;
+    
+    if (!username || !gender) {
+      return res.status(400).json({ 
+        message: 'Username and gender are required.',
+        error: 'Username and gender are required.'
+      });
+    }
+
+    if (username.length < 2) {
+      return res.status(400).json({ 
+        message: 'Username must be at least 2 characters long.',
+        error: 'Username must be at least 2 characters long.'
+      });
+    }
+
+    if (username.length > 20) {
+      return res.status(400).json({ 
+        message: 'Username must be less than 20 characters.',
+        error: 'Username must be less than 20 characters.'
+      });
+    }
+
+    // Check if username already exists
+    const existingUser = await User.findOne({ username });
+    if (existingUser) {
+      return res.status(409).json({ 
+        message: 'Username already taken. Please try another one.',
+        error: 'Username already taken. Please try another one.'
+      });
+    }
+
+    // Create anonymous user without email/password
+    const user = new User({ 
+      username: username.trim(), 
+      gender,
+      isAnonymous: true,
+      tokenVersion: 0
+    });
+
+    await user.save();
+    console.log(`✅ Anonymous user created: ${user.username}`);
+
+    // Generate token
+    const token = generateToken(user._id, user.tokenVersion);
+
+    // Set cookie
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    });
+
+    res.status(201).json({ 
+      message: 'Anonymous user created successfully!', 
+      user: { 
+        id: user._id,
+        _id: user._id, 
+        username: user.username, 
+        gender: user.gender,
+        isAnonymous: user.isAnonymous,
+        token
+      } 
+    });
+  } catch (error) {
+    console.error('Anonymous signup error:', error);
+    if (error.code === 11000) {
+      const field = Object.keys(error.keyPattern)[0];
+      return res.status(409).json({ 
+        message: `${field.charAt(0).toUpperCase() + field.slice(1)} already exists.`,
+        error: `${field.charAt(0).toUpperCase() + field.slice(1)} already exists.`
+      });
+    }
+    res.status(500).json({ 
+      message: 'Internal server error. Please try again later.',
+      error: 'Internal server error. Please try again later.'
+    });
+  }
 });
 
 app.post('/signup', async (req, res) => {
@@ -380,7 +473,7 @@ app.post('/signup', async (req, res) => {
       });
     }
 
-    const user = new User({ username, email, password, gender, tokenVersion: 0 });
+    const user = new User({ username, email, password, gender, tokenVersion: 0, isAnonymous: false });
     await user.save();
 
     res.status(201).json({ 
@@ -417,6 +510,11 @@ app.post('/login', async (req, res) => {
       return res.status(401).json({ message: 'Invalid email or password.' });
     }
 
+    // Prevent anonymous users from logging in with email/password
+    if (user.isAnonymous) {
+      return res.status(401).json({ message: 'This is an anonymous account. Cannot login with email.' });
+    }
+
     const isPasswordValid = await user.comparePassword(password);
     if (!isPasswordValid) {
       return res.status(401).json({ message: 'Invalid email or password.' });
@@ -443,8 +541,7 @@ app.post('/login', async (req, res) => {
         username: user.username, 
         email, 
         gender: user.gender,
-        token // add this
-
+        token
       }
     });
   } catch (error) {
