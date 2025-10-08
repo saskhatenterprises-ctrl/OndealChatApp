@@ -116,7 +116,7 @@ const userSchema = new mongoose.Schema({
   },
   email: { 
     type: String, 
-    unique: true,
+    unique: false,
     sparse: true, // Allow null values for anonymous users
     lowercase: true, 
     trim: true, 
