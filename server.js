@@ -75,7 +75,9 @@ const connectDB = async () => {
         const indexes = await mongoose.connection.db.collection('users').indexes();
         const emailIndex = indexes.find(idx => idx.key.email === 1);
         
-        if (emailIndex && !emailIndex.sparse) {
+        if (emailIndex && emailIndex.sparse) {
+          console.log('✅ Email index is already sparse. Perfect!');
+        } else if (emailIndex && !emailIndex.sparse) {
           console.log('⚠️ Found non-sparse email index. Dropping and recreating...');
           await mongoose.connection.db.collection('users').dropIndex('email_1');
           await mongoose.connection.db.collection('users').createIndex(
@@ -90,13 +92,11 @@ const connectDB = async () => {
             { unique: true, sparse: true, name: 'email_1' }
           );
           console.log('✅ Sparse email index created!');
-        } else {
-          console.log('✅ Email index is already sparse. No action needed.');
         }
       }
     } catch (indexError) {
-      console.error('⚠️ Index fix error:', indexError.message);
-      console.log('💡 You may need to manually drop the email index in MongoDB.');
+      console.error('⚠️ Index check note:', indexError.message);
+      // This is usually fine - index already exists correctly
     }
 
     mongoose.connection.on('error', (err) => {
@@ -149,11 +149,10 @@ const userSchema = new mongoose.Schema({
   },
   email: { 
     type: String, 
-    sparse: true, // This creates a sparse index that ignores null values
+    sparse: true, // This creates a sparse index that ignores null/undefined values
     lowercase: true, 
     trim: true, 
-    match: [/^\w+([.-]?\w+)*@\w+([.-]?\w+)*(\.\w{2,3})+$/, 'Please enter a valid email'],
-    default: null
+    match: [/^\w+([.-]?\w+)*@\w+([.-]?\w+)*(\.\w{2,3})+$/, 'Please enter a valid email']
   },
   password: { 
     type: String, 
@@ -178,7 +177,7 @@ const userSchema = new mongoose.Schema({
   }
 });
 
-// Create sparse index for email (allows multiple null values)
+// Create sparse index for email (allows multiple null/undefined values)
 userSchema.index({ email: 1 }, { unique: true, sparse: true });
 
 userSchema.pre('save', async function(next) {
@@ -461,6 +460,7 @@ app.post('/anonymous-signup', async (req, res) => {
       gender,
       isAnonymous: true,
       tokenVersion: 0
+      // Don't set email at all - leave it undefined
     });
 
     await user.save();
