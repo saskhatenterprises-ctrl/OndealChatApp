@@ -66,6 +66,39 @@ const connectDB = async () => {
     console.log(`📂 Database: ${conn.connection.name}`);
     console.log(`🔗 Host: ${conn.connection.host}`);
 
+    // Fix email index issue for anonymous users
+    try {
+      console.log('🔧 Checking email index...');
+      const collections = await mongoose.connection.db.listCollections({ name: 'users' }).toArray();
+      
+      if (collections.length > 0) {
+        const indexes = await mongoose.connection.db.collection('users').indexes();
+        const emailIndex = indexes.find(idx => idx.key.email === 1);
+        
+        if (emailIndex && !emailIndex.sparse) {
+          console.log('⚠️ Found non-sparse email index. Dropping and recreating...');
+          await mongoose.connection.db.collection('users').dropIndex('email_1');
+          await mongoose.connection.db.collection('users').createIndex(
+            { email: 1 }, 
+            { unique: true, sparse: true, name: 'email_1' }
+          );
+          console.log('✅ Email index updated to sparse successfully!');
+        } else if (!emailIndex) {
+          console.log('➕ Creating sparse email index...');
+          await mongoose.connection.db.collection('users').createIndex(
+            { email: 1 }, 
+            { unique: true, sparse: true, name: 'email_1' }
+          );
+          console.log('✅ Sparse email index created!');
+        } else {
+          console.log('✅ Email index is already sparse. No action needed.');
+        }
+      }
+    } catch (indexError) {
+      console.error('⚠️ Index fix error:', indexError.message);
+      console.log('💡 You may need to manually drop the email index in MongoDB.');
+    }
+
     mongoose.connection.on('error', (err) => {
       console.error('❌ MongoDB connection error:', err.message);
     });
@@ -116,11 +149,11 @@ const userSchema = new mongoose.Schema({
   },
   email: { 
     type: String, 
-    unique: true,
-    sparse: true, // Allow null values for anonymous users
+    sparse: true, // This creates a sparse index that ignores null values
     lowercase: true, 
     trim: true, 
-    match: [/^\w+([.-]?\w+)*@\w+([.-]?\w+)*(\.\w{2,3})+$/, 'Please enter a valid email'] 
+    match: [/^\w+([.-]?\w+)*@\w+([.-]?\w+)*(\.\w{2,3})+$/, 'Please enter a valid email'],
+    default: null
   },
   password: { 
     type: String, 
@@ -144,6 +177,9 @@ const userSchema = new mongoose.Schema({
     default: Date.now 
   }
 });
+
+// Create sparse index for email (allows multiple null values)
+userSchema.index({ email: 1 }, { unique: true, sparse: true });
 
 userSchema.pre('save', async function(next) {
   if (!this.isModified('password')) return next();
@@ -369,7 +405,7 @@ app.get('/', (req, res) => {
 // Anonymous Signup Route
 app.post('/anonymous-signup', async (req, res) => {
   try {
-    const { username, gender, isAnonymous } = req.body;
+    let { username, gender, isAnonymous } = req.body;
     
     if (!username || !gender) {
       return res.status(400).json({ 
@@ -392,18 +428,36 @@ app.post('/anonymous-signup', async (req, res) => {
       });
     }
 
-    // Check if username already exists
-    const existingUser = await User.findOne({ username });
+    // Check if username already exists and make it unique for anonymous users
+    let finalUsername = username.trim();
+    let existingUser = await User.findOne({ username: finalUsername });
+    
     if (existingUser) {
-      return res.status(409).json({ 
-        message: 'Username already taken. Please try another one.',
-        error: 'Username already taken. Please try another one.'
-      });
+      // Generate unique username by adding random numbers
+      let attempts = 0;
+      const maxAttempts = 10;
+      
+      while (existingUser && attempts < maxAttempts) {
+        const randomSuffix = Math.floor(Math.random() * 10000);
+        finalUsername = `${username.trim()}${randomSuffix}`;
+        existingUser = await User.findOne({ username: finalUsername });
+        attempts++;
+      }
+      
+      // If still exists after max attempts, return error
+      if (existingUser) {
+        return res.status(409).json({ 
+          message: 'Could not generate unique username. Please try a different name.',
+          error: 'Could not generate unique username. Please try a different name.'
+        });
+      }
+      
+      console.log(`⚠️ Username ${username} existed, created unique username: ${finalUsername}`);
     }
 
     // Create anonymous user without email/password
     const user = new User({ 
-      username: username.trim(), 
+      username: finalUsername, 
       gender,
       isAnonymous: true,
       tokenVersion: 0
