@@ -310,6 +310,7 @@ const authenticateToken = async (req, res, next) => {
 /* ----------------------------- SOCKET.IO ----------------------------- */
 
 const onlineUsers = new Map();
+const activeCalls = new Map(); // Track active calls: roomId -> { participants, callType }
 
 io.on('connection', (socket) => {
   console.log('🔌 User connected:', socket.id);
@@ -324,7 +325,7 @@ io.on('connection', (socket) => {
 
   socket.on('sendMessage', async (data) => {
     try {
-      const { senderId, receiverId, text } = data;
+      const { senderId, receiverId, text, tempId } = data;
 
       const message = new Message({
         sender: senderId,
@@ -344,7 +345,7 @@ io.on('connection', (socket) => {
         io.to(receiverSocketId).emit('receiveMessage', populatedMessage);
       }
 
-      socket.emit('messageSent', populatedMessage);
+      socket.emit('messageSent', { tempId, message: populatedMessage });
 
     } catch (error) {
       console.error('❌ Socket message error:', error);
@@ -366,13 +367,170 @@ io.on('connection', (socket) => {
     }
   });
 
+  /* ----------------------------- WEBRTC SIGNALING ----------------------------- */
+  
+  // Initiate a call
+  socket.on('initiate-call', ({ to, from, callType, roomId }) => {
+    console.log(`📞 Call initiated from ${from} to ${to}, type: ${callType}, room: ${roomId}`);
+    
+    const receiverSocketId = onlineUsers.get(to);
+    if (receiverSocketId) {
+      // Store call info
+      activeCalls.set(roomId, {
+        participants: [from, to],
+        callType,
+        initiator: from
+      });
+      
+      io.to(receiverSocketId).emit('incoming-call', {
+        from,
+        callType,
+        roomId
+      });
+    } else {
+      socket.emit('call-error', { message: 'User is not online' });
+    }
+  });
+
+  // Accept a call
+  socket.on('accept-call', ({ to, from, roomId }) => {
+    console.log(`✅ Call accepted by ${from}, notifying ${to}`);
+    
+    const receiverSocketId = onlineUsers.get(to);
+    if (receiverSocketId) {
+      io.to(receiverSocketId).emit('call-accepted', {
+        from,
+        roomId
+      });
+    }
+  });
+
+  // Reject a call
+  socket.on('reject-call', ({ to, from }) => {
+    console.log(`❌ Call rejected by ${from}, notifying ${to}`);
+    
+    const receiverSocketId = onlineUsers.get(to);
+    if (receiverSocketId) {
+      io.to(receiverSocketId).emit('call-rejected', { from });
+    }
+  });
+
+  // End a call
+  socket.on('end-call', ({ to, from }) => {
+    console.log(`📞 Call ended by ${from}, notifying ${to}`);
+    
+    const receiverSocketId = onlineUsers.get(to);
+    if (receiverSocketId) {
+      io.to(receiverSocketId).emit('call-ended', { from });
+    }
+    
+    // Clean up active calls
+    for (const [roomId, call] of activeCalls.entries()) {
+      if (call.participants.includes(from)) {
+        activeCalls.delete(roomId);
+        break;
+      }
+    }
+  });
+
+  // Join a call room
+  socket.on('join-call', ({ roomId, userId }) => {
+    console.log(`👤 User ${userId} joining call room: ${roomId}`);
+    socket.join(roomId);
+    
+    const call = activeCalls.get(roomId);
+    if (call && !call.participants.includes(userId)) {
+      call.participants.push(userId);
+    }
+    
+    // Notify others in the room
+    socket.to(roomId).emit('user-joined-call', { userId, roomId });
+  });
+
+  // Leave a call room
+  socket.on('leave-call', ({ roomId, userId }) => {
+    console.log(`👤 User ${userId} leaving call room: ${roomId}`);
+    socket.leave(roomId);
+    
+    socket.to(roomId).emit('user-left-call', { userId });
+    
+    // Clean up if room is empty
+    const call = activeCalls.get(roomId);
+    if (call) {
+      call.participants = call.participants.filter(id => id !== userId);
+      if (call.participants.length === 0) {
+        activeCalls.delete(roomId);
+      }
+    }
+  });
+
+  // WebRTC Offer
+  socket.on('webrtc-offer', ({ offer, to, roomId }) => {
+    console.log(`📨 WebRTC offer from ${socket.id} to ${to}`);
+    const receiverSocketId = onlineUsers.get(to);
+    if (receiverSocketId) {
+      io.to(receiverSocketId).emit('webrtc-offer', {
+        offer,
+        from: socket.userId,
+        roomId
+      });
+    }
+  });
+
+  // WebRTC Answer
+  socket.on('webrtc-answer', ({ answer, to, roomId }) => {
+    console.log(`📨 WebRTC answer from ${socket.id} to ${to}`);
+    const receiverSocketId = onlineUsers.get(to);
+    if (receiverSocketId) {
+      io.to(receiverSocketId).emit('webrtc-answer', {
+        answer,
+        from: socket.userId,
+        roomId
+      });
+    }
+  });
+
+  // ICE Candidates
+  socket.on('ice-candidate', ({ candidate, to }) => {
+    console.log(`🧊 ICE candidate from ${socket.id} to ${to}`);
+    const receiverSocketId = onlineUsers.get(to);
+    if (receiverSocketId) {
+      io.to(receiverSocketId).emit('ice-candidate', {
+        candidate,
+        from: socket.userId
+      });
+    }
+  });
+
   socket.on('disconnect', () => {
     console.log('🔌 User disconnected:', socket.id);
     
+    // Clean up user from online users
     for (const [userId, socketId] of onlineUsers.entries()) {
       if (socketId === socket.id) {
         onlineUsers.delete(userId);
         console.log(`👤 User ${userId} removed from online users`);
+        
+        // Clean up any active calls for this user
+        for (const [roomId, call] of activeCalls.entries()) {
+          if (call.participants.includes(userId)) {
+            // Notify other participants
+            call.participants.forEach(participantId => {
+              if (participantId !== userId) {
+                const participantSocketId = onlineUsers.get(participantId);
+                if (participantSocketId) {
+                  io.to(participantSocketId).emit('user-left-call', { userId });
+                }
+              }
+            });
+            
+            // Remove user from call
+            call.participants = call.participants.filter(id => id !== userId);
+            if (call.participants.length === 0) {
+              activeCalls.delete(roomId);
+            }
+          }
+        }
         break;
       }
     }
@@ -748,7 +906,8 @@ app.get('/health', async (req, res) => {
       name: mongoose.connection.name || 'not connected'
     },
     environment: process.env.NODE_ENV || 'development',
-    onlineUsers: onlineUsers.size
+    onlineUsers: onlineUsers.size,
+    activeCalls: activeCalls.size
   });
 });
 
@@ -779,4 +938,5 @@ server.listen(PORT, () => {
   console.log(`🌐 Client URL: ${process.env.CLIENT_URL || 'http://localhost:3000'}`);
   console.log(`🔑 JWT Secret: ${process.env.JWT_SECRET ? 'configured' : 'using default (INSECURE!)'}`);
   console.log(`📊 MongoDB URI: ${(process.env.MONGO_URI || process.env.MONGODB_URI) ? 'configured' : 'NOT CONFIGURED!'}`);
+  console.log(`📞 WebRTC Signaling: ✅ ENABLED`);
 });
