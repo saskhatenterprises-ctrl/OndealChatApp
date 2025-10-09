@@ -315,8 +315,10 @@ const activeCalls = new Map(); // Track active calls: roomId -> { participants, 
 io.on('connection', (socket) => {
   console.log('🔌 User connected:', socket.id);
 
+  // Add user ID to socket for WebRTC signaling
   socket.on('register', (userId) => {
     if (userId) {
+      socket.userId = userId; // THIS IS CRITICAL
       onlineUsers.set(userId, socket.id);
       console.log(`👤 User ${userId} registered with socket ${socket.id}`);
       io.emit('onlineUsers', Array.from(onlineUsers.keys()));
