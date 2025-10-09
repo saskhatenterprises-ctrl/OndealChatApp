@@ -149,7 +149,8 @@ const userSchema = new mongoose.Schema({
   },
   email: { 
     type: String, 
-    sparse: true, // This creates a sparse index that ignores null/undefined values
+    unique: true, // This automatically creates a unique index
+    sparse: true, // This makes it sparse (ignores null/undefined)
     lowercase: true, 
     trim: true, 
     match: [/^\w+([.-]?\w+)*@\w+([.-]?\w+)*(\.\w{2,3})+$/, 'Please enter a valid email']
@@ -177,8 +178,7 @@ const userSchema = new mongoose.Schema({
   }
 });
 
-// Create sparse index for email (allows multiple null/undefined values)
-userSchema.index({ email: 1 }, { unique: true, sparse: true });
+// REMOVED THE DUPLICATE INDEX CREATION - using the schema definition above is enough
 
 userSchema.pre('save', async function(next) {
   if (!this.isModified('password')) return next();
