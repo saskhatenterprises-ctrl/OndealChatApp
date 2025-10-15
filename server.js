@@ -369,140 +369,196 @@ io.on('connection', (socket) => {
     }
   });
 
-  /* ----------------------------- WEBRTC SIGNALING ----------------------------- */
+// Replace the WEBRTC SIGNALING section with this fixed version:
+
+/* ----------------------------- WEBRTC SIGNALING ----------------------------- */
+
+// Initiate a call
+socket.on('initiate-call', ({ to, from, callType, roomId }) => {
+  console.log(`📞 Call initiated from ${from} to ${to}, type: ${callType}, room: ${roomId}`);
   
-  // Initiate a call
-  socket.on('initiate-call', ({ to, from, callType, roomId }) => {
-    console.log(`📞 Call initiated from ${from} to ${to}, type: ${callType}, room: ${roomId}`);
+  // Store the userId from the event
+  if (!socket.userId) {
+    socket.userId = from;
+    console.log(`⚠️ Set socket.userId from initiate-call: ${from}`);
+  }
+  
+  const receiverSocketId = onlineUsers.get(to);
+  if (receiverSocketId) {
+    // Store call info
+    activeCalls.set(roomId, {
+      participants: [from, to],
+      callType,
+      initiator: from
+    });
     
-    const receiverSocketId = onlineUsers.get(to);
-    if (receiverSocketId) {
-      // Store call info
-      activeCalls.set(roomId, {
-        participants: [from, to],
-        callType,
-        initiator: from
-      });
-      
-      io.to(receiverSocketId).emit('incoming-call', {
-        from,
-        callType,
-        roomId
-      });
-    } else {
-      socket.emit('call-error', { message: 'User is not online' });
-    }
-  });
+    io.to(receiverSocketId).emit('incoming-call', {
+      from,
+      callType,
+      roomId
+    });
+    console.log(`✅ Incoming call emitted to ${to}`);
+  } else {
+    console.log(`❌ Receiver ${to} not online`);
+    socket.emit('call-error', { message: 'User is not online' });
+  }
+});
 
-  // Accept a call
-  socket.on('accept-call', ({ to, from, roomId }) => {
-    console.log(`✅ Call accepted by ${from}, notifying ${to}`);
-    
-    const receiverSocketId = onlineUsers.get(to);
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit('call-accepted', {
-        from,
-        roomId
-      });
-    }
-  });
+// Accept a call
+socket.on('accept-call', ({ to, from, roomId }) => {
+  console.log(`✅ Call accepted by ${from}, notifying ${to}`);
+  
+  // Store the userId from the event
+  if (!socket.userId) {
+    socket.userId = from;
+    console.log(`⚠️ Set socket.userId from accept-call: ${from}`);
+  }
+  
+  const receiverSocketId = onlineUsers.get(to);
+  if (receiverSocketId) {
+    io.to(receiverSocketId).emit('call-accepted', {
+      from,
+      roomId
+    });
+    console.log(`✅ Call accepted notification sent to ${to}`);
+  } else {
+    console.log(`❌ Caller ${to} not online`);
+  }
+});
 
-  // Reject a call
-  socket.on('reject-call', ({ to, from }) => {
-    console.log(`❌ Call rejected by ${from}, notifying ${to}`);
-    
-    const receiverSocketId = onlineUsers.get(to);
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit('call-rejected', { from });
-    }
-  });
+// Reject a call
+socket.on('reject-call', ({ to, from }) => {
+  console.log(`❌ Call rejected by ${from}, notifying ${to}`);
+  
+  const receiverSocketId = onlineUsers.get(to);
+  if (receiverSocketId) {
+    io.to(receiverSocketId).emit('call-rejected', { from });
+  }
+});
 
-  // End a call
-  socket.on('end-call', ({ to, from }) => {
-    console.log(`📞 Call ended by ${from}, notifying ${to}`);
-    
-    const receiverSocketId = onlineUsers.get(to);
+// End a call
+socket.on('end-call', ({ to, from }) => {
+  console.log(`📞 Call ended by ${from}, notifying:`, to);
+  
+  // Handle both single user and array of users
+  const recipients = Array.isArray(to) ? to : [to];
+  
+  recipients.forEach(recipientId => {
+    const receiverSocketId = onlineUsers.get(recipientId);
     if (receiverSocketId) {
       io.to(receiverSocketId).emit('call-ended', { from });
-    }
-    
-    // Clean up active calls
-    for (const [roomId, call] of activeCalls.entries()) {
-      if (call.participants.includes(from)) {
-        activeCalls.delete(roomId);
-        break;
-      }
+      console.log(`✅ Call ended notification sent to ${recipientId}`);
     }
   });
+  
+  // Clean up active calls
+  for (const [roomId, call] of activeCalls.entries()) {
+    if (call.participants.includes(from)) {
+      activeCalls.delete(roomId);
+      console.log(`🧹 Cleaned up call room: ${roomId}`);
+      break;
+    }
+  }
+});
 
-  // Join a call room
-  socket.on('join-call', ({ roomId, userId }) => {
-    console.log(`👤 User ${userId} joining call room: ${roomId}`);
-    socket.join(roomId);
-    
-    const call = activeCalls.get(roomId);
-    if (call && !call.participants.includes(userId)) {
-      call.participants.push(userId);
-    }
-    
-    // Notify others in the room
-    socket.to(roomId).emit('user-joined-call', { userId, roomId });
-  });
+// Join a call room
+socket.on('join-call', ({ roomId, userId }) => {
+  console.log(`👤 User ${userId} joining call room: ${roomId}`);
+  socket.join(roomId);
+  
+  const call = activeCalls.get(roomId);
+  if (call && !call.participants.includes(userId)) {
+    call.participants.push(userId);
+  }
+  
+  // Notify others in the room
+  socket.to(roomId).emit('user-joined-call', { userId, roomId });
+});
 
-  // Leave a call room
-  socket.on('leave-call', ({ roomId, userId }) => {
-    console.log(`👤 User ${userId} leaving call room: ${roomId}`);
-    socket.leave(roomId);
-    
-    socket.to(roomId).emit('user-left-call', { userId });
-    
-    // Clean up if room is empty
-    const call = activeCalls.get(roomId);
-    if (call) {
-      call.participants = call.participants.filter(id => id !== userId);
-      if (call.participants.length === 0) {
-        activeCalls.delete(roomId);
-      }
+// Leave a call room
+socket.on('leave-call', ({ roomId, userId }) => {
+  console.log(`👤 User ${userId} leaving call room: ${roomId}`);
+  socket.leave(roomId);
+  
+  socket.to(roomId).emit('user-left-call', { userId });
+  
+  // Clean up if room is empty
+  const call = activeCalls.get(roomId);
+  if (call) {
+    call.participants = call.participants.filter(id => id !== userId);
+    if (call.participants.length === 0) {
+      activeCalls.delete(roomId);
     }
-  });
+  }
+});
 
-  // WebRTC Offer
-  socket.on('webrtc-offer', ({ offer, to, roomId }) => {
-    console.log(`📨 WebRTC offer from ${socket.id} to ${to}`);
-    const receiverSocketId = onlineUsers.get(to);
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit('webrtc-offer', {
-        offer,
-        from: socket.userId,
-        roomId
-      });
-    }
-  });
+// WebRTC Offer - FIXED
+socket.on('webrtc-offer', ({ offer, to, roomId }) => {
+  const from = socket.userId;
+  console.log(`📨 WebRTC offer from ${from} (socket: ${socket.id}) to ${to}`);
+  
+  if (!from) {
+    console.error('❌ socket.userId not set for webrtc-offer!');
+    return;
+  }
+  
+  const receiverSocketId = onlineUsers.get(to);
+  if (receiverSocketId) {
+    io.to(receiverSocketId).emit('webrtc-offer', {
+      offer,
+      from: from, // Use from variable instead of socket.userId
+      roomId
+    });
+    console.log(`✅ WebRTC offer forwarded to ${to}`);
+  } else {
+    console.log(`❌ Receiver ${to} not found for WebRTC offer`);
+  }
+});
 
-  // WebRTC Answer
-  socket.on('webrtc-answer', ({ answer, to, roomId }) => {
-    console.log(`📨 WebRTC answer from ${socket.id} to ${to}`);
-    const receiverSocketId = onlineUsers.get(to);
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit('webrtc-answer', {
-        answer,
-        from: socket.userId,
-        roomId
-      });
-    }
-  });
+// WebRTC Answer - FIXED
+socket.on('webrtc-answer', ({ answer, to, roomId }) => {
+  const from = socket.userId;
+  console.log(`📨 WebRTC answer from ${from} (socket: ${socket.id}) to ${to}`);
+  
+  if (!from) {
+    console.error('❌ socket.userId not set for webrtc-answer!');
+    return;
+  }
+  
+  const receiverSocketId = onlineUsers.get(to);
+  if (receiverSocketId) {
+    io.to(receiverSocketId).emit('webrtc-answer', {
+      answer,
+      from: from, // Use from variable instead of socket.userId
+      roomId
+    });
+    console.log(`✅ WebRTC answer forwarded to ${to}`);
+  } else {
+    console.log(`❌ Receiver ${to} not found for WebRTC answer`);
+  }
+});
 
-  // ICE Candidates
-  socket.on('ice-candidate', ({ candidate, to }) => {
-    console.log(`🧊 ICE candidate from ${socket.id} to ${to}`);
-    const receiverSocketId = onlineUsers.get(to);
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit('ice-candidate', {
-        candidate,
-        from: socket.userId
-      });
-    }
-  });
+// ICE Candidates - FIXED
+socket.on('ice-candidate', ({ candidate, to, roomId }) => {
+  const from = socket.userId;
+  console.log(`🧊 ICE candidate from ${from} (socket: ${socket.id}) to ${to}`);
+  
+  if (!from) {
+    console.error('❌ socket.userId not set for ice-candidate!');
+    return;
+  }
+  
+  const receiverSocketId = onlineUsers.get(to);
+  if (receiverSocketId) {
+    io.to(receiverSocketId).emit('ice-candidate', {
+      candidate,
+      from: from // Use from variable instead of socket.userId
+    });
+    console.log(`✅ ICE candidate forwarded to ${to}`);
+  } else {
+    console.log(`❌ Receiver ${to} not found for ICE candidate`);
+  }
+});
 
   socket.on('disconnect', () => {
     console.log('🔌 User disconnected:', socket.id);
