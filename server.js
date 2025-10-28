@@ -313,6 +313,12 @@ io.on('connection', (socket) => {
         return;
       }
 
+      console.log(`Message from ${senderId} to ${receiverId}: ${text.substring(0, 50)}...`);
+
+      // Check if this is a random chat message
+      const isRandomChat = activeRandomChats.get(senderId) === receiverId;
+      
+      // Save message to database
       const message = new Message({ 
         sender: senderId, 
         receiver: receiverId, 
@@ -330,27 +336,40 @@ io.on('connection', (socket) => {
         throw new Error('Failed to populate message');
       }
 
+      // Send to receiver
       const receiverSocketId = onlineUsers.get(receiverId);
       if (receiverSocketId) {
         io.to(receiverSocketId).emit('receiveMessage', populatedMessage);
+        console.log(`Message delivered to ${receiverId} (socket: ${receiverSocketId})`);
+      } else {
+        console.log(`Receiver ${receiverId} not online`);
       }
       
+      // Confirm to sender
       socket.emit('messageSent', { tempId, message: populatedMessage });
       
     } catch (err) {
       console.error('sendMessage error:', err.message);
-      socket.emit('messageError', { message: 'Failed to send message' });
+      socket.emit('messageError', { message: 'Failed to send message', error: err.message });
     }
   });
 
   socket.on('typing', ({ senderId, receiverId }) => {
+    if (!senderId || !receiverId) return;
+    console.log(`${senderId} typing to ${receiverId}`);
     const receiverSocketId = onlineUsers.get(receiverId);
-    if (receiverSocketId) io.to(receiverSocketId).emit('userTyping', { userId: senderId });
+    if (receiverSocketId) {
+      io.to(receiverSocketId).emit('userTyping', { userId: senderId });
+      console.log(`Typing indicator sent to ${receiverId}`);
+    }
   });
 
   socket.on('stopTyping', ({ senderId, receiverId }) => {
+    if (!senderId || !receiverId) return;
     const receiverSocketId = onlineUsers.get(receiverId);
-    if (receiverSocketId) io.to(receiverSocketId).emit('userStoppedTyping', { userId: senderId });
+    if (receiverSocketId) {
+      io.to(receiverSocketId).emit('userStoppedTyping', { userId: senderId });
+    }
   });
 
   /* ----------------------------- RANDOM CHAT EVENTS ----------------------------- */
@@ -1015,10 +1034,37 @@ app.get('/health', async (req, res) => {
     onlineUsers: onlineUsers.size,
     activeCalls: activeCalls.size,
     randomChat: {
+      poolSize: randomChatPool.size,
       waitingUsers: waitingUsers.size,
       activeChats: activeRandomChats.size / 2,
       activeSessions: randomChatSessions.size
+    },
+    sockets: {
+      connectedSockets: io.sockets.sockets.size
     }
+  });
+});
+
+// Debug endpoint to check socket mappings
+app.get('/debug/sockets', authenticateToken, (req, res) => {
+  const onlineUsersArray = Array.from(onlineUsers.entries()).map(([userId, socketId]) => ({
+    userId,
+    socketId
+  }));
+  
+  const randomChatPoolArray = Array.from(randomChatPool);
+  const activeChatsArray = Array.from(activeRandomChats.entries()).map(([userId, partnerId]) => ({
+    userId,
+    partnerId
+  }));
+  
+  res.json({
+    onlineUsers: onlineUsersArray,
+    randomChatPool: randomChatPoolArray,
+    activeRandomChats: activeChatsArray,
+    totalOnline: onlineUsers.size,
+    totalInPool: randomChatPool.size,
+    totalActiveChats: activeRandomChats.size / 2
   });
 });
 
