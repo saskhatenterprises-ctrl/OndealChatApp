@@ -166,6 +166,7 @@ const activeCalls = new Map(); // roomId -> { participants: [userId], callType, 
 const waitingUsers = new Map(); // userId -> { socketId, username }
 const activeRandomChats = new Map(); // userId -> matchedUserId
 const randomChatSessions = new Map(); // sessionId -> { participants, createdAt }
+const randomChatPool = new Set(); // userId who are open to random chats (online + waiting)
 
 /* ----------------------------- SOCKET AUTH MIDDLEWARE ----------------------------- */
 
@@ -199,6 +200,7 @@ io.on('connection', (socket) => {
   // Auto-register user
   if (socket.userId) {
     onlineUsers.set(socket.userId, socket.id);
+    randomChatPool.add(socket.userId); // Automatically add to random chat pool
     console.log(`Auto-registered user ${socket.userId} -> socket ${socket.id}`);
     io.emit('onlineUsers', Array.from(onlineUsers.keys()));
     
@@ -208,13 +210,70 @@ io.on('connection', (socket) => {
 
   // Helper function to broadcast availability
   function broadcastRandomChatAvailability() {
-    // Available if there are waiting users OR if there are other online users
-    // (excluding users already in active random chats)
-    const availableForMatching = Array.from(onlineUsers.keys()).filter(userId => 
+    // Available if there are users in random chat pool (excluding those already matched)
+    const availableForMatching = Array.from(randomChatPool).filter(userId => 
       !activeRandomChats.has(userId)
     );
-    const isAvailable = waitingUsers.size > 0 || availableForMatching.length > 1;
+    const isAvailable = availableForMatching.length > 1; // Need at least 2 for matching
     io.emit('random-chat-available', isAvailable);
+  }
+
+  // Helper function to auto-match users
+  async function tryAutoMatch(userId) {
+    try {
+      // Find available users in the pool (not already matched, not this user)
+      const availableUsers = Array.from(randomChatPool).filter(id => 
+        id !== userId && 
+        !activeRandomChats.has(id) &&
+        onlineUsers.has(id) // Must be online
+      );
+
+      if (availableUsers.length > 0) {
+        const matchedUserId = availableUsers[0];
+        const [user, matchedUser] = await Promise.all([
+          User.findById(userId).select('username email _id gender'),
+          User.findById(matchedUserId).select('username email _id gender')
+        ]);
+
+        if (user && matchedUser) {
+          // Remove from waiting if they were waiting
+          waitingUsers.delete(userId);
+          waitingUsers.delete(matchedUserId);
+          
+          // Create chat session
+          activeRandomChats.set(userId, matchedUserId);
+          activeRandomChats.set(matchedUserId, userId);
+          
+          const sessionId = `random-${Date.now()}`;
+          randomChatSessions.set(sessionId, {
+            participants: [userId, matchedUserId],
+            createdAt: new Date()
+          });
+
+          // Notify both users
+          const userSocketId = onlineUsers.get(userId);
+          const matchedSocketId = onlineUsers.get(matchedUserId);
+          
+          if (userSocketId) {
+            io.to(userSocketId).emit('random-match-found', matchedUser);
+          }
+          
+          if (matchedSocketId) {
+            io.to(matchedSocketId).emit('random-match-found', user);
+          }
+          
+          console.log(`Auto-match created: ${userId} <-> ${matchedUserId}`);
+          
+          // Broadcast updated availability
+          broadcastRandomChatAvailability();
+          return true;
+        }
+      }
+      return false;
+    } catch (error) {
+      console.error('Error in auto-match:', error);
+      return false;
+    }
   }
 
   // Explicit registration
@@ -233,6 +292,7 @@ io.on('connection', (socket) => {
 
       socket.userId = userId.toString();
       onlineUsers.set(socket.userId, socket.id);
+      randomChatPool.add(socket.userId); // Add to random chat pool
       console.log(`User registered: ${socket.userId} -> socket ${socket.id}`);
       io.emit('onlineUsers', Array.from(onlineUsers.keys()));
       
@@ -296,11 +356,13 @@ io.on('connection', (socket) => {
   /* ----------------------------- RANDOM CHAT EVENTS ----------------------------- */
   
   socket.on('check-random-chat-availability', () => {
-    // Check if there are other users online who could potentially match
-    const availableForMatching = Array.from(onlineUsers.keys()).filter(userId => 
-      userId !== socket.userId && !activeRandomChats.has(userId)
+    // Check if there are other users in the pool who could match
+    const availableForMatching = Array.from(randomChatPool).filter(userId => 
+      userId !== socket.userId && 
+      !activeRandomChats.has(userId) &&
+      onlineUsers.has(userId)
     );
-    const isAvailable = waitingUsers.size > 0 || availableForMatching.length > 0;
+    const isAvailable = availableForMatching.length > 0;
     socket.emit('random-chat-available', isAvailable);
   });
 
@@ -328,63 +390,20 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // Check if already waiting
-      if (waitingUsers.has(userId)) {
-        socket.emit('random-chat-waiting', { waitingCount: waitingUsers.size });
-        return;
-      }
-
-      // Find a match (exclude self)
-      const availableUsers = Array.from(waitingUsers.keys()).filter(id => 
-        id !== userId && 
-        !activeRandomChats.has(id)
-      );
-
-      if (availableUsers.length > 0) {
-        // Match with first available user
-        const matchedUserId = availableUsers[0];
-        const matchedUserData = waitingUsers.get(matchedUserId);
-        const matchedUser = await User.findById(matchedUserId).select('username email _id gender');
-        
-        if (matchedUser && matchedUserData) {
-          // Remove from waiting
-          waitingUsers.delete(userId);
-          waitingUsers.delete(matchedUserId);
-          
-          // Create chat session
-          activeRandomChats.set(userId, matchedUserId);
-          activeRandomChats.set(matchedUserId, userId);
-          
-          const sessionId = `random-${Date.now()}`;
-          randomChatSessions.set(sessionId, {
-            participants: [userId, matchedUserId],
-            createdAt: new Date()
-          });
-
-          // Notify both users
-          const currentUser = await User.findById(userId).select('username email _id gender');
-          const matchedSocketId = onlineUsers.get(matchedUserId);
-          
-          socket.emit('random-match-found', matchedUser);
-          
-          if (matchedSocketId) {
-            io.to(matchedSocketId).emit('random-match-found', currentUser);
-          }
-          
-          console.log(`Random match created: ${userId} <-> ${matchedUserId}`);
-          
-          // Broadcast updated availability
-          broadcastRandomChatAvailability();
-        }
-      } else {
-        // Add to waiting pool
-        waitingUsers.set(userId, { socketId: socket.id, username: username || user.username });
+      // Add to waiting pool
+      waitingUsers.set(userId, { socketId: socket.id, username: username || user.username });
+      
+      // Try to find an immediate match from the random chat pool
+      const matched = await tryAutoMatch(userId);
+      
+      if (!matched) {
+        // No match found yet, user is waiting
         socket.emit('random-chat-waiting', { waitingCount: waitingUsers.size });
         console.log(`User ${userId} added to waiting pool. Total waiting: ${waitingUsers.size}`);
-        
-        // Broadcast updated availability
-        broadcastRandomChatAvailability();
       }
+      
+      // Broadcast updated availability
+      broadcastRandomChatAvailability();
       
     } catch (error) {
       console.error('Error in start-random-chat:', error);
@@ -404,13 +423,27 @@ io.on('connection', (socket) => {
     // Remove from waiting
     waitingUsers.delete(userId);
     
-    // If in active chat, notify partner and end chat
+    // If in active chat, notify partner
     const partnerId = activeRandomChats.get(userId);
     if (partnerId) {
       const partnerSocketId = onlineUsers.get(partnerId);
       if (partnerSocketId) {
         io.to(partnerSocketId).emit('random-match-left');
+        
+        // Auto-match the partner with someone new
+        setTimeout(async () => {
+          const rematched = await tryAutoMatch(partnerId);
+          if (!rematched) {
+            // Add partner to waiting pool for next match
+            const partner = await User.findById(partnerId);
+            if (partner) {
+              waitingUsers.set(partnerId, { socketId: partnerSocketId, username: partner.username });
+              io.to(partnerSocketId).emit('random-chat-waiting', { waitingCount: waitingUsers.size });
+            }
+          }
+        }, 1000);
       }
+      
       activeRandomChats.delete(partnerId);
       activeRandomChats.delete(userId);
       
@@ -579,12 +612,13 @@ io.on('connection', (socket) => {
   });
 
   /* ----------------------------- DISCONNECT ----------------------------- */
-  socket.on('disconnect', (reason) => {
+  socket.on('disconnect', async (reason) => {
     console.log(`Socket disconnected: ${socket.id} (reason: ${reason})`);
     
     if (socket.userId) {
       onlineUsers.delete(socket.userId);
       waitingUsers.delete(socket.userId);
+      randomChatPool.delete(socket.userId);
       
       console.log(`User ${socket.userId} removed from online/waiting users`);
       
@@ -594,7 +628,25 @@ io.on('connection', (socket) => {
         const partnerSocketId = onlineUsers.get(partnerId);
         if (partnerSocketId) {
           io.to(partnerSocketId).emit('random-match-left');
+          
+          // Auto-match the partner with someone new after a brief delay
+          setTimeout(async () => {
+            const rematched = await tryAutoMatch(partnerId);
+            if (!rematched) {
+              // Add partner to waiting pool for next match
+              try {
+                const partner = await User.findById(partnerId);
+                if (partner && onlineUsers.has(partnerId)) {
+                  waitingUsers.set(partnerId, { socketId: partnerSocketId, username: partner.username });
+                  io.to(partnerSocketId).emit('random-chat-waiting', { waitingCount: waitingUsers.size });
+                }
+              } catch (err) {
+                console.error('Error auto-rematching partner:', err);
+              }
+            }
+          }, 1000);
         }
+        
         activeRandomChats.delete(partnerId);
         activeRandomChats.delete(socket.userId);
         
