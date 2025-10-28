@@ -208,8 +208,12 @@ io.on('connection', (socket) => {
 
   // Helper function to broadcast availability
   function broadcastRandomChatAvailability() {
-    const availableCount = waitingUsers.size;
-    const isAvailable = availableCount > 0;
+    // Available if there are waiting users OR if there are other online users
+    // (excluding users already in active random chats)
+    const availableForMatching = Array.from(onlineUsers.keys()).filter(userId => 
+      !activeRandomChats.has(userId)
+    );
+    const isAvailable = waitingUsers.size > 0 || availableForMatching.length > 1;
     io.emit('random-chat-available', isAvailable);
   }
 
@@ -292,7 +296,11 @@ io.on('connection', (socket) => {
   /* ----------------------------- RANDOM CHAT EVENTS ----------------------------- */
   
   socket.on('check-random-chat-availability', () => {
-    const isAvailable = waitingUsers.size > 0;
+    // Check if there are other users online who could potentially match
+    const availableForMatching = Array.from(onlineUsers.keys()).filter(userId => 
+      userId !== socket.userId && !activeRandomChats.has(userId)
+    );
+    const isAvailable = waitingUsers.size > 0 || availableForMatching.length > 0;
     socket.emit('random-chat-available', isAvailable);
   });
 
