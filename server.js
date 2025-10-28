@@ -165,9 +165,12 @@ const authenticateToken = async (req, res, next) => {
 
 /* ----------------------------- SOCKET AUTH MIDDLEWARE ----------------------------- */
 
-// Map: userId -> socketId (single device). If multi-device desired, change to array.
-const onlineUsers = new Map();
+// Maps for tracking users and sessions
+const onlineUsers = new Map(); // userId -> socketId
 const activeCalls = new Map(); // roomId -> { participants: [userId], callType, initiator }
+const waitingUsers = new Map(); // userId -> socketId for random chat
+const activeRandomChats = new Map(); // userId -> matchedUserId
+const randomChatSessions = new Map(); // sessionId -> { participants, createdAt }
 
 io.use((socket, next) => {
   try {
@@ -232,6 +235,173 @@ io.on('connection', (socket) => {
   socket.on('stopTyping', ({ senderId, receiverId }) => {
     const receiverSocketId = onlineUsers.get(receiverId);
     if (receiverSocketId) io.to(receiverSocketId).emit('userStoppedTyping', { userId: senderId });
+  });
+
+  /* ----------------------------- RANDOM CHAT EVENTS ----------------------------- */
+  
+  // Check if random chat is available
+  socket.on('check-random-chat-availability', () => {
+    const availableUsers = Array.from(waitingUsers.keys()).filter(id => 
+      id !== socket.userId && !activeRandomChats.has(id)
+    );
+    const isAvailable = availableUsers.length > 0 || waitingUsers.size > 0;
+    socket.emit('random-chat-available', isAvailable);
+  });
+
+  // Start looking for random chat
+  socket.on('start-random-chat', async (data) => {
+    try {
+      const { userId, username } = data;
+      
+      if (!userId) {
+        socket.emit('random-chat-error', { message: 'User ID required' });
+        return;
+      }
+
+      console.log(`User ${userId} started random chat search`);
+      
+      // Add user to waiting pool
+      waitingUsers.set(userId, socket.id);
+      socket.emit('random-chat-waiting');
+      
+      // Find a random match (excluding self and already matched users)
+      const availableUsers = Array.from(waitingUsers.keys()).filter(id => 
+        id !== userId && 
+        !activeRandomChats.has(id)
+      );
+      
+      if (availableUsers.length > 0) {
+        // Pick a random user
+        const randomIndex = Math.floor(Math.random() * availableUsers.length);
+        const matchedUserId = availableUsers[randomIndex];
+        
+        // Get matched user details from database
+        const matchedUser = await User.findById(matchedUserId).select('username email _id gender');
+        
+        if (matchedUser) {
+          // Create chat session
+          const sessionId = `random-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+          
+          activeRandomChats.set(userId, matchedUserId);
+          activeRandomChats.set(matchedUserId, userId);
+          randomChatSessions.set(sessionId, {
+            participants: [userId, matchedUserId],
+            createdAt: new Date()
+          });
+          
+          // Remove both from waiting
+          waitingUsers.delete(userId);
+          waitingUsers.delete(matchedUserId);
+          
+          // Get current user details for the matched user
+          const currentUser = await User.findById(userId).select('username email _id gender');
+          
+          // Notify both users
+          socket.emit('random-match-found', matchedUser);
+          
+          const matchedUserSocketId = onlineUsers.get(matchedUserId);
+          if (matchedUserSocketId) {
+            io.to(matchedUserSocketId).emit('random-match-found', currentUser);
+          }
+          
+          console.log(`Random match created: ${userId} <-> ${matchedUserId}`);
+          
+        } else {
+          waitingUsers.delete(userId);
+          socket.emit('random-chat-error', { message: 'Match user not found' });
+        }
+      } else {
+        // No users available, keep waiting
+        console.log(`User ${userId} waiting for random match (${waitingUsers.size} users waiting)`);
+        socket.emit('random-chat-waiting', { waitingCount: waitingUsers.size });
+      }
+      
+    } catch (error) {
+      console.error('Error in start-random-chat:', error);
+      if (data.userId) waitingUsers.delete(data.userId);
+      socket.emit('random-chat-error', { message: 'Failed to find match' });
+    }
+  });
+
+  // Stop random chat
+  socket.on('stop-random-chat', (data) => {
+    const { userId } = data;
+    
+    console.log(`User ${userId} stopped random chat`);
+    
+    // Remove from waiting
+    waitingUsers.delete(userId);
+    
+    // If in active chat, notify partner and end chat
+    const partnerId = activeRandomChats.get(userId);
+    if (partnerId) {
+      const partnerSocketId = onlineUsers.get(partnerId);
+      if (partnerSocketId) {
+        io.to(partnerSocketId).emit('random-match-left');
+      }
+      activeRandomChats.delete(partnerId);
+      activeRandomChats.delete(userId);
+      
+      // Clean up session
+      for (const [sessionId, session] of randomChatSessions.entries()) {
+        if (session.participants.includes(userId)) {
+          randomChatSessions.delete(sessionId);
+          break;
+        }
+      }
+    }
+    
+    socket.emit('random-chat-stopped');
+  });
+
+  // Send message in random chat
+  socket.on('send-random-message', async (data) => {
+    try {
+      const { senderId, receiverId, text, tempId } = data;
+      
+      // Verify this is a valid random chat pair
+      if (activeRandomChats.get(senderId) === receiverId) {
+        // Save message to database
+        const message = new Message({
+          sender: senderId,
+          receiver: receiverId,
+          text: text
+        });
+        
+        await message.save();
+        await message.populate('sender', 'username email gender');
+        
+        // Emit to receiver
+        const receiverSocketId = onlineUsers.get(receiverId);
+        if (receiverSocketId) {
+          io.to(receiverSocketId).emit('receiveMessage', message);
+        }
+        
+        // Confirm to sender
+        socket.emit('messageSent', { tempId, message });
+      } else {
+        socket.emit('messageError', { message: 'Not in a valid random chat session' });
+      }
+      
+    } catch (error) {
+      console.error('Error sending random message:', error);
+      socket.emit('messageError', { message: 'Failed to send message' });
+    }
+  });
+
+  // Get random chat status
+  socket.on('get-random-chat-status', (data) => {
+    const { userId } = data;
+    const isWaiting = waitingUsers.has(userId);
+    const isMatched = activeRandomChats.has(userId);
+    const matchedWith = activeRandomChats.get(userId);
+    
+    socket.emit('random-chat-status', {
+      isWaiting,
+      isMatched,
+      matchedWith,
+      waitingCount: waitingUsers.size
+    });
   });
 
   /* ----------------------------- WEBRTC SIGNALING ----------------------------- */
@@ -367,11 +537,34 @@ io.on('connection', (socket) => {
   /* ----------------------------- DISCONNECT ----------------------------- */
   socket.on('disconnect', (reason) => {
     console.log(`Socket disconnected: ${socket.id} (reason: ${reason})`);
-    // remove from onlineUsers
+    
+    // remove from onlineUsers and waitingUsers
     for (const [userId, sockId] of onlineUsers.entries()) {
       if (sockId === socket.id) {
         onlineUsers.delete(userId);
-        console.log(`User ${userId} removed from onlineUsers`);
+        waitingUsers.delete(userId); // Also remove from waiting
+        
+        console.log(`User ${userId} removed from onlineUsers and waitingUsers`);
+        
+        // Handle random chat cleanup
+        const partnerId = activeRandomChats.get(userId);
+        if (partnerId) {
+          const partnerSocketId = onlineUsers.get(partnerId);
+          if (partnerSocketId) {
+            io.to(partnerSocketId).emit('random-match-left');
+          }
+          activeRandomChats.delete(partnerId);
+          activeRandomChats.delete(userId);
+          
+          // Clean up session
+          for (const [sessionId, session] of randomChatSessions.entries()) {
+            if (session.participants.includes(userId)) {
+              randomChatSessions.delete(sessionId);
+              break;
+            }
+          }
+        }
+        
         // notify participants in any active calls they left
         for (const [roomId, call] of activeCalls.entries()) {
           if (call.participants.includes(userId)) {
@@ -397,7 +590,19 @@ io.on('connection', (socket) => {
 app.get('/', (req, res) => {
   res.json({
     message: 'API is running!',
-    endpoints: { health: '/health', signup: 'POST /signup', anonymousSignup: 'POST /anonymous-signup', login: 'POST /login', logout: 'POST /logout', profile: 'GET /me', users: 'GET /users', messages: 'GET /messages/:userId' }
+    endpoints: { 
+      health: '/health', 
+      signup: 'POST /signup', 
+      anonymousSignup: 'POST /anonymous-signup', 
+      login: 'POST /login', 
+      logout: 'POST /logout', 
+      profile: 'GET /me', 
+      users: 'GET /users', 
+      messages: 'GET /messages/:userId',
+      randomChatStats: 'GET /random-chat/stats',
+      randomChatStatus: 'GET /random-chat/status',
+      leaveRandomChat: 'POST /random-chat/leave'
+    }
   });
 });
 
@@ -550,6 +755,83 @@ app.get('/users', authenticateToken, async (req, res) => {
   }
 });
 
+/* ----------------------------- RANDOM CHAT ROUTES ----------------------------- */
+
+// Get random chat statistics
+app.get('/random-chat/stats', authenticateToken, async (req, res) => {
+  try {
+    const stats = {
+      onlineUsers: onlineUsers.size,
+      waitingUsers: waitingUsers.size,
+      activeRandomChats: activeRandomChats.size / 2, // Divide by 2 since each chat has 2 entries
+      activeSessions: randomChatSessions.size
+    };
+    res.json(stats);
+  } catch (err) {
+    console.error('random-chat/stats error:', err.message);
+    res.status(500).json({ message: 'Failed to get stats' });
+  }
+});
+
+// Get user's random chat status
+app.get('/random-chat/status', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.userId.toString();
+    const isWaiting = waitingUsers.has(userId);
+    const isMatched = activeRandomChats.has(userId);
+    const matchedWith = activeRandomChats.get(userId);
+    
+    let matchedUser = null;
+    if (isMatched && matchedWith) {
+      matchedUser = await User.findById(matchedWith).select('username gender _id');
+    }
+    
+    res.json({
+      isWaiting,
+      isMatched,
+      matchedWith: matchedUser,
+      waitingCount: waitingUsers.size
+    });
+  } catch (err) {
+    console.error('random-chat/status error:', err.message);
+    res.status(500).json({ message: 'Failed to get status' });
+  }
+});
+
+// Leave random chat
+app.post('/random-chat/leave', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.userId.toString();
+    
+    // Remove from waiting
+    waitingUsers.delete(userId);
+    
+    // If in active chat, notify partner and end chat
+    const partnerId = activeRandomChats.get(userId);
+    if (partnerId) {
+      const partnerSocketId = onlineUsers.get(partnerId);
+      if (partnerSocketId) {
+        io.to(partnerSocketId).emit('random-match-left');
+      }
+      activeRandomChats.delete(partnerId);
+      activeRandomChats.delete(userId);
+      
+      // Clean up session
+      for (const [sessionId, session] of randomChatSessions.entries()) {
+        if (session.participants.includes(userId)) {
+          randomChatSessions.delete(sessionId);
+          break;
+        }
+      }
+    }
+    
+    res.json({ message: 'Left random chat successfully' });
+  } catch (err) {
+    console.error('random-chat/leave error:', err.message);
+    res.status(500).json({ message: 'Failed to leave random chat' });
+  }
+});
+
 app.get('/health', async (req, res) => {
   const dbState = mongoose.connection.readyState;
   const dbStates = { 0: 'disconnected', 1: 'connected', 2: 'connecting', 3: 'disconnecting' };
@@ -560,7 +842,12 @@ app.get('/health', async (req, res) => {
     database: { status: dbStates[dbState], host: mongoose.connection.host || 'not connected', name: mongoose.connection.name || 'not connected' },
     environment: process.env.NODE_ENV || 'development',
     onlineUsers: onlineUsers.size,
-    activeCalls: activeCalls.size
+    activeCalls: activeCalls.size,
+    randomChat: {
+      waitingUsers: waitingUsers.size,
+      activeChats: activeRandomChats.size / 2,
+      activeSessions: randomChatSessions.size
+    }
   });
 });
 
@@ -581,4 +868,5 @@ server.listen(PORT, () => {
   console.log(`🔑 JWT Secret: ${process.env.JWT_SECRET ? 'configured' : 'using default (INSECURE!)'}`);
   console.log(`📊 MongoDB URI: ${(process.env.MONGO_URI || process.env.MONGODB_URI) ? 'configured' : 'NOT CONFIGURED!'}`);
   console.log(`📞 WebRTC Signaling: ✅ ENABLED`);
+  console.log(`🎲 Random Chat: ✅ ENABLED`);
 });
