@@ -35,7 +35,9 @@ const io = new Server(server, {
     origin: allowedOrigins,
     methods: ["GET", "POST"],
     credentials: true
-  }
+  },
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
 /* ----------------------------- MONGODB ----------------------------- */
@@ -58,7 +60,6 @@ const connectDB = async () => {
     const conn = await mongoose.connect(mongoURI, options);
     console.log(`MongoDB connected: ${conn.connection.host}/${conn.connection.name}`);
 
-    // Connection event handlers
     mongoose.connection.on('connected', () => {
       console.log('✅ MongoDB connected successfully');
     });
@@ -158,13 +159,15 @@ const authenticateToken = async (req, res, next) => {
   }
 };
 
-/* ----------------------------- SOCKET AUTH MIDDLEWARE ----------------------------- */
+/* ----------------------------- SOCKET DATA STRUCTURES ----------------------------- */
 
 const onlineUsers = new Map(); // userId -> socketId
 const activeCalls = new Map(); // roomId -> { participants: [userId], callType, initiator }
-const waitingUsers = new Map(); // userId -> socketId for random chat
+const waitingUsers = new Map(); // userId -> { socketId, username }
 const activeRandomChats = new Map(); // userId -> matchedUserId
 const randomChatSessions = new Map(); // sessionId -> { participants, createdAt }
+
+/* ----------------------------- SOCKET AUTH MIDDLEWARE ----------------------------- */
 
 io.use((socket, next) => {
   try {
@@ -198,16 +201,27 @@ io.on('connection', (socket) => {
     onlineUsers.set(socket.userId, socket.id);
     console.log(`Auto-registered user ${socket.userId} -> socket ${socket.id}`);
     io.emit('onlineUsers', Array.from(onlineUsers.keys()));
+    
+    // Broadcast random chat availability
+    broadcastRandomChatAvailability();
+  }
+
+  // Helper function to broadcast availability
+  function broadcastRandomChatAvailability() {
+    const availableCount = waitingUsers.size;
+    const isAvailable = availableCount > 0;
+    io.emit('random-chat-available', isAvailable);
   }
 
   // Explicit registration
-  socket.on('register', (userId) => {
+  socket.on('register', async (userId) => {
     if (!userId) {
       socket.emit('error', { message: 'User ID required' });
       return;
     }
 
-    User.findById(userId).then(user => {
+    try {
+      const user = await User.findById(userId);
       if (!user) {
         socket.emit('error', { message: 'User not found' });
         return;
@@ -217,10 +231,12 @@ io.on('connection', (socket) => {
       onlineUsers.set(socket.userId, socket.id);
       console.log(`User registered: ${socket.userId} -> socket ${socket.id}`);
       io.emit('onlineUsers', Array.from(onlineUsers.keys()));
-    }).catch(err => {
+      
+      broadcastRandomChatAvailability();
+    } catch (err) {
       console.error('Registration error:', err);
       socket.emit('error', { message: 'Registration failed' });
-    });
+    }
   });
 
   /* ---------- Messaging ---------- */
@@ -276,10 +292,7 @@ io.on('connection', (socket) => {
   /* ----------------------------- RANDOM CHAT EVENTS ----------------------------- */
   
   socket.on('check-random-chat-availability', () => {
-    const availableUsers = Array.from(waitingUsers.keys()).filter(id => 
-      id !== socket.userId && !activeRandomChats.has(id)
-    );
-    const isAvailable = availableUsers.length > 0 || waitingUsers.size > 0;
+    const isAvailable = waitingUsers.size > 0;
     socket.emit('random-chat-available', isAvailable);
   });
 
@@ -299,7 +312,7 @@ io.on('connection', (socket) => {
         return;
       }
 
-      console.log(`User ${userId} started random chat search`);
+      console.log(`User ${userId} (${username}) started random chat search`);
       
       // Check if already in a chat
       if (activeRandomChats.has(userId)) {
@@ -313,10 +326,6 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // Add to waiting pool
-      waitingUsers.set(userId, socket.id);
-      socket.emit('random-chat-waiting', { waitingCount: waitingUsers.size });
-
       // Find a match (exclude self)
       const availableUsers = Array.from(waitingUsers.keys()).filter(id => 
         id !== userId && 
@@ -324,10 +333,12 @@ io.on('connection', (socket) => {
       );
 
       if (availableUsers.length > 0) {
-        const matchedUserId = availableUsers[0]; // Take first available
+        // Match with first available user
+        const matchedUserId = availableUsers[0];
+        const matchedUserData = waitingUsers.get(matchedUserId);
         const matchedUser = await User.findById(matchedUserId).select('username email _id gender');
         
-        if (matchedUser) {
+        if (matchedUser && matchedUserData) {
           // Remove from waiting
           waitingUsers.delete(userId);
           waitingUsers.delete(matchedUserId);
@@ -353,13 +364,25 @@ io.on('connection', (socket) => {
           }
           
           console.log(`Random match created: ${userId} <-> ${matchedUserId}`);
+          
+          // Broadcast updated availability
+          broadcastRandomChatAvailability();
         }
+      } else {
+        // Add to waiting pool
+        waitingUsers.set(userId, { socketId: socket.id, username: username || user.username });
+        socket.emit('random-chat-waiting', { waitingCount: waitingUsers.size });
+        console.log(`User ${userId} added to waiting pool. Total waiting: ${waitingUsers.size}`);
+        
+        // Broadcast updated availability
+        broadcastRandomChatAvailability();
       }
       
     } catch (error) {
       console.error('Error in start-random-chat:', error);
       if (data.userId) waitingUsers.delete(data.userId);
       socket.emit('random-chat-error', { message: 'Failed to find match' });
+      broadcastRandomChatAvailability();
     }
   });
 
@@ -393,53 +416,7 @@ io.on('connection', (socket) => {
     }
     
     socket.emit('random-chat-stopped');
-  });
-
-  socket.on('send-random-message', async (data) => {
-    try {
-      const { senderId, receiverId, text, tempId } = data;
-      
-      // Verify this is a valid random chat pair
-      if (activeRandomChats.get(senderId) === receiverId) {
-        const message = new Message({
-          sender: senderId,
-          receiver: receiverId,
-          text: text
-        });
-        
-        await message.save();
-        await message.populate('sender', 'username email gender');
-        
-        // Emit to receiver
-        const receiverSocketId = onlineUsers.get(receiverId);
-        if (receiverSocketId) {
-          io.to(receiverSocketId).emit('receiveMessage', message);
-        }
-        
-        // Confirm to sender
-        socket.emit('messageSent', { tempId, message });
-      } else {
-        socket.emit('messageError', { message: 'Not in a valid random chat session' });
-      }
-      
-    } catch (error) {
-      console.error('Error sending random message:', error);
-      socket.emit('messageError', { message: 'Failed to send message' });
-    }
-  });
-
-  socket.on('get-random-chat-status', (data) => {
-    const { userId } = data;
-    const isWaiting = waitingUsers.has(userId);
-    const isMatched = activeRandomChats.has(userId);
-    const matchedWith = activeRandomChats.get(userId);
-    
-    socket.emit('random-chat-status', {
-      isWaiting,
-      isMatched,
-      matchedWith,
-      waitingCount: waitingUsers.size
-    });
+    broadcastRandomChatAvailability();
   });
 
   /* ----------------------------- WEBRTC SIGNALING ----------------------------- */
@@ -517,7 +494,8 @@ io.on('connection', (socket) => {
       const rid = onlineUsers.get(recipientId);
       if (rid) io.to(rid).emit('call-ended', { from });
     });
-    // cleanup any call rooms that include 'from'
+    
+    // Cleanup call rooms that include 'from'
     for (const [rid, call] of activeCalls.entries()) {
       if (call.participants.includes(from)) {
         activeCalls.delete(rid);
@@ -637,6 +615,7 @@ io.on('connection', (socket) => {
     }
     
     io.emit('onlineUsers', Array.from(onlineUsers.keys()));
+    broadcastRandomChatAvailability();
   });
 });
 
@@ -652,8 +631,10 @@ app.get('/', (req, res) => {
       login: 'POST /login', 
       logout: 'POST /logout', 
       profile: 'GET /me', 
+      updateProfile: 'PUT /profile',
       users: 'GET /users', 
       messages: 'GET /messages/:userId',
+      sendMessage: 'POST /messages',
       randomChatStats: 'GET /random-chat/stats',
       randomChatStatus: 'GET /random-chat/status',
       leaveRandomChat: 'POST /random-chat/leave'
