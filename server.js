@@ -15,7 +15,7 @@ const server = http.createServer(app);
 app.use(express.json());
 app.use(cookieParser());
 
-// CORS config (supports multiple origins in CLIENT_URL env var)
+// CORS config
 const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:3000')
   .split(',')
   .map(o => o.trim());
@@ -29,7 +29,7 @@ app.use(cors({
   credentials: true
 }));
 
-// Socket.IO setup with same CORS list
+// Socket.IO setup
 const io = new Server(server, {
   cors: {
     origin: allowedOrigins,
@@ -58,28 +58,19 @@ const connectDB = async () => {
     const conn = await mongoose.connect(mongoURI, options);
     console.log(`MongoDB connected: ${conn.connection.host}/${conn.connection.name}`);
 
-    // Ensure sparse unique email index
-    try {
-      const colls = await mongoose.connection.db.listCollections({ name: 'users' }).toArray();
-      if (colls.length > 0) {
-        const idxs = await mongoose.connection.db.collection('users').indexes();
-        const emailIdx = idxs.find(i => i.key && i.key.email === 1);
-        if (!emailIdx || (emailIdx && !emailIdx.sparse)) {
-          try {
-            if (emailIdx && emailIdx.name) {
-              await mongoose.connection.db.collection('users').dropIndex(emailIdx.name);
-            }
-          } catch (e) {}
-          await mongoose.connection.db.collection('users').createIndex(
-            { email: 1 },
-            { unique: true, sparse: true, name: 'email_1' }
-          );
-          console.log('Sparse email index ensured.');
-        }
-      }
-    } catch (indexError) {
-      console.warn('Index check error (non-fatal):', indexError.message);
-    }
+    // Connection event handlers
+    mongoose.connection.on('connected', () => {
+      console.log('✅ MongoDB connected successfully');
+    });
+
+    mongoose.connection.on('error', (err) => {
+      console.error('❌ MongoDB connection error:', err);
+    });
+
+    mongoose.connection.on('disconnected', () => {
+      console.log('⚠️ MongoDB disconnected');
+    });
+
   } catch (err) {
     console.error('DB connection failed:', err.message);
     if (process.env.NODE_ENV === 'production') {
@@ -144,15 +135,19 @@ const authenticateToken = async (req, res, next) => {
   try {
     const token = req.cookies.token || req.header('Authorization')?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ message: 'No token provided.' });
+    
     const decoded = jwt.verify(token, JWT_SECRET);
     const user = await User.findById(decoded.userId).select('-password');
     if (!user) return res.status(401).json({ message: 'User not found.' });
+    
     if (user.tokenVersion === undefined || user.tokenVersion === null) {
       user.tokenVersion = 0;
       await user.save();
     }
+    
     if (decoded.tokenVersion === undefined) return res.status(401).json({ message: 'Old token format.' });
     if (decoded.tokenVersion !== user.tokenVersion) return res.status(401).json({ message: 'Session invalidated.' });
+    
     req.userId = decoded.userId;
     req.user = user;
     next();
@@ -165,7 +160,6 @@ const authenticateToken = async (req, res, next) => {
 
 /* ----------------------------- SOCKET AUTH MIDDLEWARE ----------------------------- */
 
-// Maps for tracking users and sessions
 const onlineUsers = new Map(); // userId -> socketId
 const activeCalls = new Map(); // roomId -> { participants: [userId], callType, initiator }
 const waitingUsers = new Map(); // userId -> socketId for random chat
@@ -174,53 +168,95 @@ const randomChatSessions = new Map(); // sessionId -> { participants, createdAt 
 
 io.use((socket, next) => {
   try {
-    // Accept token in handshake auth or authorization header
     const token = socket.handshake.auth?.token || socket.handshake.headers?.authorization?.replace('Bearer ', '');
-    if (!token) return next();
+    if (!token) {
+      console.log('Socket connection rejected: No token provided');
+      return next(new Error('Authentication required'));
+    }
+    
     const decoded = jwt.verify(token, JWT_SECRET);
     if (decoded && decoded.userId) {
-      socket.userId = decoded.userId;
+      socket.userId = decoded.userId.toString();
       console.log(`Socket authenticated for user ${socket.userId} (socket ${socket.id})`);
+      return next();
+    } else {
+      return next(new Error('Invalid token'));
     }
-    return next();
   } catch (err) {
     console.warn('Socket auth failed:', err.message);
-    // Allow connection to continue (so anonymous/guest flows still work). To disallow: next(new Error('Authentication error'));
-    return next();
+    return next(new Error('Authentication error'));
   }
 });
 
 /* ----------------------------- SOCKET.IO EVENTS ----------------------------- */
 
 io.on('connection', (socket) => {
-  console.log('Socket connected:', socket.id);
+  console.log('Socket connected:', socket.id, 'User:', socket.userId);
 
-  // Auto-register if socket.userId already present from handshake token
+  // Auto-register user
   if (socket.userId) {
     onlineUsers.set(socket.userId, socket.id);
     console.log(`Auto-registered user ${socket.userId} -> socket ${socket.id}`);
     io.emit('onlineUsers', Array.from(onlineUsers.keys()));
   }
 
-  // explicit registration (backwards-compatible)
+  // Explicit registration
   socket.on('register', (userId) => {
-    if (!userId) return;
-    socket.userId = userId;
-    onlineUsers.set(userId, socket.id);
-    console.log(`User registered: ${userId} -> socket ${socket.id}`);
-    io.emit('onlineUsers', Array.from(onlineUsers.keys()));
+    if (!userId) {
+      socket.emit('error', { message: 'User ID required' });
+      return;
+    }
+
+    User.findById(userId).then(user => {
+      if (!user) {
+        socket.emit('error', { message: 'User not found' });
+        return;
+      }
+
+      socket.userId = userId.toString();
+      onlineUsers.set(socket.userId, socket.id);
+      console.log(`User registered: ${socket.userId} -> socket ${socket.id}`);
+      io.emit('onlineUsers', Array.from(onlineUsers.keys()));
+    }).catch(err => {
+      console.error('Registration error:', err);
+      socket.emit('error', { message: 'Registration failed' });
+    });
   });
 
   /* ---------- Messaging ---------- */
   socket.on('sendMessage', async (data) => {
     try {
       const { senderId, receiverId, text, tempId } = data;
-      const message = new Message({ sender: senderId, receiver: receiverId, text });
+      
+      if (!senderId || !receiverId || !text) {
+        socket.emit('messageError', { message: 'Missing required fields' });
+        return;
+      }
+
+      const message = new Message({ 
+        sender: senderId, 
+        receiver: receiverId, 
+        text: text.substring(0, 1000)
+      });
+      
       await message.save();
-      const populatedMessage = await message.populate([{ path: 'sender', select: 'username email' }, { path: 'receiver', select: 'username email' }]);
+      
+      const populatedMessage = await Message.findById(message._id)
+        .populate('sender', 'username email')
+        .populate('receiver', 'username email')
+        .exec();
+      
+      if (!populatedMessage) {
+        throw new Error('Failed to populate message');
+      }
+
       const receiverSocketId = onlineUsers.get(receiverId);
-      if (receiverSocketId) io.to(receiverSocketId).emit('receiveMessage', populatedMessage);
+      if (receiverSocketId) {
+        io.to(receiverSocketId).emit('receiveMessage', populatedMessage);
+      }
+      
       socket.emit('messageSent', { tempId, message: populatedMessage });
+      
     } catch (err) {
       console.error('sendMessage error:', err.message);
       socket.emit('messageError', { message: 'Failed to send message' });
@@ -239,7 +275,6 @@ io.on('connection', (socket) => {
 
   /* ----------------------------- RANDOM CHAT EVENTS ----------------------------- */
   
-  // Check if random chat is available
   socket.on('check-random-chat-availability', () => {
     const availableUsers = Array.from(waitingUsers.keys()).filter(id => 
       id !== socket.userId && !activeRandomChats.has(id)
@@ -248,72 +283,77 @@ io.on('connection', (socket) => {
     socket.emit('random-chat-available', isAvailable);
   });
 
-  // Start looking for random chat
   socket.on('start-random-chat', async (data) => {
     try {
       const { userId, username } = data;
       
-      if (!userId) {
-        socket.emit('random-chat-error', { message: 'User ID required' });
+      if (!userId || !socket.userId) {
+        socket.emit('random-chat-error', { message: 'Authentication required' });
+        return;
+      }
+
+      // Verify user exists
+      const user = await User.findById(userId);
+      if (!user) {
+        socket.emit('random-chat-error', { message: 'User not found' });
         return;
       }
 
       console.log(`User ${userId} started random chat search`);
       
-      // Add user to waiting pool
+      // Check if already in a chat
+      if (activeRandomChats.has(userId)) {
+        socket.emit('random-chat-error', { message: 'Already in a random chat' });
+        return;
+      }
+
+      // Check if already waiting
+      if (waitingUsers.has(userId)) {
+        socket.emit('random-chat-waiting', { waitingCount: waitingUsers.size });
+        return;
+      }
+
+      // Add to waiting pool
       waitingUsers.set(userId, socket.id);
-      socket.emit('random-chat-waiting');
-      
-      // Find a random match (excluding self and already matched users)
+      socket.emit('random-chat-waiting', { waitingCount: waitingUsers.size });
+
+      // Find a match (exclude self)
       const availableUsers = Array.from(waitingUsers.keys()).filter(id => 
         id !== userId && 
         !activeRandomChats.has(id)
       );
-      
+
       if (availableUsers.length > 0) {
-        // Pick a random user
-        const randomIndex = Math.floor(Math.random() * availableUsers.length);
-        const matchedUserId = availableUsers[randomIndex];
-        
-        // Get matched user details from database
+        const matchedUserId = availableUsers[0]; // Take first available
         const matchedUser = await User.findById(matchedUserId).select('username email _id gender');
         
         if (matchedUser) {
-          // Create chat session
-          const sessionId = `random-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+          // Remove from waiting
+          waitingUsers.delete(userId);
+          waitingUsers.delete(matchedUserId);
           
+          // Create chat session
           activeRandomChats.set(userId, matchedUserId);
           activeRandomChats.set(matchedUserId, userId);
+          
+          const sessionId = `random-${Date.now()}`;
           randomChatSessions.set(sessionId, {
             participants: [userId, matchedUserId],
             createdAt: new Date()
           });
-          
-          // Remove both from waiting
-          waitingUsers.delete(userId);
-          waitingUsers.delete(matchedUserId);
-          
-          // Get current user details for the matched user
-          const currentUser = await User.findById(userId).select('username email _id gender');
-          
+
           // Notify both users
+          const currentUser = await User.findById(userId).select('username email _id gender');
+          const matchedSocketId = onlineUsers.get(matchedUserId);
+          
           socket.emit('random-match-found', matchedUser);
           
-          const matchedUserSocketId = onlineUsers.get(matchedUserId);
-          if (matchedUserSocketId) {
-            io.to(matchedUserSocketId).emit('random-match-found', currentUser);
+          if (matchedSocketId) {
+            io.to(matchedSocketId).emit('random-match-found', currentUser);
           }
           
           console.log(`Random match created: ${userId} <-> ${matchedUserId}`);
-          
-        } else {
-          waitingUsers.delete(userId);
-          socket.emit('random-chat-error', { message: 'Match user not found' });
         }
-      } else {
-        // No users available, keep waiting
-        console.log(`User ${userId} waiting for random match (${waitingUsers.size} users waiting)`);
-        socket.emit('random-chat-waiting', { waitingCount: waitingUsers.size });
       }
       
     } catch (error) {
@@ -323,9 +363,10 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Stop random chat
   socket.on('stop-random-chat', (data) => {
     const { userId } = data;
+    
+    if (!userId) return;
     
     console.log(`User ${userId} stopped random chat`);
     
@@ -354,14 +395,12 @@ io.on('connection', (socket) => {
     socket.emit('random-chat-stopped');
   });
 
-  // Send message in random chat
   socket.on('send-random-message', async (data) => {
     try {
       const { senderId, receiverId, text, tempId } = data;
       
       // Verify this is a valid random chat pair
       if (activeRandomChats.get(senderId) === receiverId) {
-        // Save message to database
         const message = new Message({
           sender: senderId,
           receiver: receiverId,
@@ -389,7 +428,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Get random chat status
   socket.on('get-random-chat-status', (data) => {
     const { userId } = data;
     const isWaiting = waitingUsers.has(userId);
@@ -406,22 +444,49 @@ io.on('connection', (socket) => {
 
   /* ----------------------------- WEBRTC SIGNALING ----------------------------- */
 
-  socket.on('initiate-call', ({ to, from, callType, roomId }) => {
-    console.log(`Call initiated: from=${from}, to=${to}, type=${callType}, room=${roomId}`);
-    if (!socket.userId) {
-      // If not set, set from so forwarding uses consistent value
-      socket.userId = from;
-      console.log(`Set socket.userId from payload: ${from}`);
-    }
+  socket.on('initiate-call', async ({ to, from, callType, roomId }) => {
+    try {
+      console.log(`Call initiated: from=${from}, to=${to}, type=${callType}, room=${roomId}`);
+      
+      if (!socket.userId) {
+        socket.userId = from;
+      }
 
-    const receiverSocketId = onlineUsers.get(to);
-    if (receiverSocketId) {
-      activeCalls.set(roomId, { participants: [from, to], callType, initiator: from });
-      io.to(receiverSocketId).emit('incoming-call', { from, callType, roomId, caller: { _id: from } });
-      console.log(`Incoming call forwarded to ${to}`);
-    } else {
-      console.log(`Receiver ${to} not online`);
-      socket.emit('call-error', { message: 'User is not online' });
+      // Verify both users exist
+      const [caller, receiver] = await Promise.all([
+        User.findById(from),
+        User.findById(to)
+      ]);
+
+      if (!caller || !receiver) {
+        socket.emit('call-error', { message: 'User not found' });
+        return;
+      }
+
+      const receiverSocketId = onlineUsers.get(to);
+      if (receiverSocketId) {
+        activeCalls.set(roomId, { 
+          participants: [from, to], 
+          callType, 
+          initiator: from,
+          caller: { _id: caller._id, username: caller.username }
+        });
+        
+        io.to(receiverSocketId).emit('incoming-call', { 
+          from, 
+          callType, 
+          roomId, 
+          caller: { _id: caller._id, username: caller.username } 
+        });
+        
+        console.log(`Incoming call forwarded to ${to}`);
+      } else {
+        console.log(`Receiver ${to} not online`);
+        socket.emit('call-error', { message: 'User is not online' });
+      }
+    } catch (error) {
+      console.error('Call initiation error:', error);
+      socket.emit('call-error', { message: 'Failed to initiate call' });
     }
   });
 
@@ -429,7 +494,6 @@ io.on('connection', (socket) => {
     console.log(`Call accepted: from=${from} (callee), notify caller=${to}, room=${roomId}`);
     if (!socket.userId) {
       socket.userId = from;
-      console.log(`Set socket.userId from payload: ${from}`);
     }
     const receiverSocketId = onlineUsers.get(to);
     if (receiverSocketId) {
@@ -462,7 +526,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Join/Leave call room (useful for group calls or server-side room notifications)
   socket.on('join-call', ({ roomId, userId }) => {
     console.log(`User ${userId} joining room ${roomId}`);
     socket.join(roomId);
@@ -496,7 +559,6 @@ io.on('connection', (socket) => {
       return;
     }
     io.to(receiverSocketId).emit('webrtc-offer', { offer, from, roomId });
-    console.log(`Forwarded offer from ${from} to ${to}`);
   });
 
   // Forward WebRTC answer
@@ -513,74 +575,67 @@ io.on('connection', (socket) => {
       return;
     }
     io.to(receiverSocketId).emit('webrtc-answer', { answer, from, roomId });
-    console.log(`Forwarded answer from ${from} to ${to}`);
   });
 
   // Forward ICE candidates
   socket.on('ice-candidate', ({ candidate, to, roomId }) => {
     const from = socket.userId;
-    console.log(`ice-candidate: from=${from}, to=${to}, room=${roomId}`);
     if (!from) {
       socket.emit('call-error', { message: 'Socket not authenticated for signalling' });
       return;
     }
     const receiverSocketId = onlineUsers.get(to);
     if (!receiverSocketId) {
-      // it's common for candidates to be sent before peer is fully registered; warn not fatal
       console.warn(`ice-candidate: recipient ${to} not online`);
       return;
     }
     io.to(receiverSocketId).emit('ice-candidate', { candidate, from, roomId });
-    // no need to log every candidate in verbose environments - but helpful for debugging
   });
 
   /* ----------------------------- DISCONNECT ----------------------------- */
   socket.on('disconnect', (reason) => {
     console.log(`Socket disconnected: ${socket.id} (reason: ${reason})`);
     
-    // remove from onlineUsers and waitingUsers
-    for (const [userId, sockId] of onlineUsers.entries()) {
-      if (sockId === socket.id) {
-        onlineUsers.delete(userId);
-        waitingUsers.delete(userId); // Also remove from waiting
+    if (socket.userId) {
+      onlineUsers.delete(socket.userId);
+      waitingUsers.delete(socket.userId);
+      
+      console.log(`User ${socket.userId} removed from online/waiting users`);
+      
+      // Handle random chat cleanup
+      const partnerId = activeRandomChats.get(socket.userId);
+      if (partnerId) {
+        const partnerSocketId = onlineUsers.get(partnerId);
+        if (partnerSocketId) {
+          io.to(partnerSocketId).emit('random-match-left');
+        }
+        activeRandomChats.delete(partnerId);
+        activeRandomChats.delete(socket.userId);
         
-        console.log(`User ${userId} removed from onlineUsers and waitingUsers`);
-        
-        // Handle random chat cleanup
-        const partnerId = activeRandomChats.get(userId);
-        if (partnerId) {
-          const partnerSocketId = onlineUsers.get(partnerId);
-          if (partnerSocketId) {
-            io.to(partnerSocketId).emit('random-match-left');
+        // Clean up session
+        for (const [sessionId, session] of randomChatSessions.entries()) {
+          if (session.participants.includes(socket.userId)) {
+            randomChatSessions.delete(sessionId);
+            break;
           }
-          activeRandomChats.delete(partnerId);
-          activeRandomChats.delete(userId);
-          
-          // Clean up session
-          for (const [sessionId, session] of randomChatSessions.entries()) {
-            if (session.participants.includes(userId)) {
-              randomChatSessions.delete(sessionId);
-              break;
+        }
+      }
+      
+      // Clean up active calls
+      for (const [roomId, call] of activeCalls.entries()) {
+        if (call.participants.includes(socket.userId)) {
+          call.participants.forEach(participantId => {
+            if (participantId !== socket.userId) {
+              const participantSocket = onlineUsers.get(participantId);
+              if (participantSocket) io.to(participantSocket).emit('user-left-call', { userId: socket.userId });
             }
-          }
+          });
+          call.participants = call.participants.filter(id => id !== socket.userId);
+          if (call.participants.length === 0) activeCalls.delete(roomId);
         }
-        
-        // notify participants in any active calls they left
-        for (const [roomId, call] of activeCalls.entries()) {
-          if (call.participants.includes(userId)) {
-            call.participants.forEach(participantId => {
-              if (participantId !== userId) {
-                const participantSocket = onlineUsers.get(participantId);
-                if (participantSocket) io.to(participantSocket).emit('user-left-call', { userId });
-              }
-            });
-            call.participants = call.participants.filter(id => id !== userId);
-            if (call.participants.length === 0) activeCalls.delete(roomId);
-          }
-        }
-        break;
       }
     }
+    
     io.emit('onlineUsers', Array.from(onlineUsers.keys()));
   });
 });
@@ -606,13 +661,15 @@ app.get('/', (req, res) => {
   });
 });
 
-// anonymous signup
+// Anonymous signup
 app.post('/anonymous-signup', async (req, res) => {
   try {
     let { username, gender } = req.body;
     if (!username || !gender) return res.status(400).json({ message: 'Username and gender required.' });
+    
     let finalUsername = username.trim();
     let existing = await User.findOne({ username: finalUsername });
+    
     if (existing) {
       let attempts = 0, maxAttempts = 10;
       while (existing && attempts < maxAttempts) {
@@ -623,8 +680,10 @@ app.post('/anonymous-signup', async (req, res) => {
       }
       if (existing) return res.status(409).json({ message: 'Could not generate unique username.' });
     }
+    
     const user = new User({ username: finalUsername, gender, isAnonymous: true, tokenVersion: 0 });
     await user.save();
+    
     const token = generateToken(user._id, user.tokenVersion);
     res.cookie('token', token, {
       httpOnly: true,
@@ -632,7 +691,16 @@ app.post('/anonymous-signup', async (req, res) => {
       sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       maxAge: 7 * 24 * 60 * 60 * 1000
     });
-    res.status(201).json({ message: 'Anonymous user created', user: { _id: user._id, username: user.username, gender: user.gender, token } });
+    
+    res.status(201).json({ 
+      message: 'Anonymous user created', 
+      user: { 
+        _id: user._id, 
+        username: user.username, 
+        gender: user.gender, 
+        token 
+      } 
+    });
   } catch (err) {
     console.error('anonymous-signup error:', err.message);
     if (err.code === 11000) return res.status(409).json({ message: 'Duplicate field' });
@@ -640,17 +708,37 @@ app.post('/anonymous-signup', async (req, res) => {
   }
 });
 
-// signup
+// Regular signup
 app.post('/signup', async (req, res) => {
   try {
     const { username, email, password, gender } = req.body;
-    if (!username || !email || !password || !gender) return res.status(400).json({ message: 'All fields required.' });
-    if (password.length < 6) return res.status(400).json({ message: 'Password must be >= 6 chars.' });
+    if (!username || !email || !password || !gender) {
+      return res.status(400).json({ message: 'All fields required.' });
+    }
+    
+    if (password.length < 6) {
+      return res.status(400).json({ message: 'Password must be >= 6 chars.' });
+    }
+    
     const existing = await User.findOne({ $or: [{ email }, { username }] });
-    if (existing) return res.status(409).json({ message: existing.email === email ? 'Email taken' : 'Username taken' });
+    if (existing) {
+      return res.status(409).json({ 
+        message: existing.email === email ? 'Email taken' : 'Username taken' 
+      });
+    }
+    
     const user = new User({ username, email, password, gender, tokenVersion: 0, isAnonymous: false });
     await user.save();
-    res.status(201).json({ message: 'User created', user: { id: user._id, username, email, gender } });
+    
+    res.status(201).json({ 
+      message: 'User created', 
+      user: { 
+        id: user._id, 
+        username, 
+        email, 
+        gender 
+      } 
+    });
   } catch (err) {
     console.error('signup error:', err.message);
     if (err.code === 11000) return res.status(409).json({ message: 'Duplicate field' });
@@ -658,18 +746,27 @@ app.post('/signup', async (req, res) => {
   }
 });
 
-// login
+// Login
 app.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ message: 'Email & password required.' });
+    if (!email || !password) {
+      return res.status(400).json({ message: 'Email & password required.' });
+    }
+    
     const user = await User.findOne({ email });
     if (!user) return res.status(401).json({ message: 'Invalid credentials.' });
-    if (user.isAnonymous) return res.status(401).json({ message: 'Anonymous account - cannot log in via email.' });
+    
+    if (user.isAnonymous) {
+      return res.status(401).json({ message: 'Anonymous account - cannot log in via email.' });
+    }
+    
     const ok = await user.comparePassword(password);
     if (!ok) return res.status(401).json({ message: 'Invalid credentials.' });
+    
     user.tokenVersion += 1;
     await user.save();
+    
     const token = generateToken(user._id, user.tokenVersion);
     res.cookie('token', token, {
       httpOnly: true,
@@ -677,7 +774,16 @@ app.post('/login', async (req, res) => {
       sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       maxAge: 7 * 24 * 60 * 60 * 1000
     });
-    res.json({ message: 'Login successful', user: { id: user._id, username: user.username, email: user.email, token } });
+    
+    res.json({ 
+      message: 'Login successful', 
+      user: { 
+        id: user._id, 
+        username: user.username, 
+        email: user.email, 
+        token 
+      } 
+    });
   } catch (err) {
     console.error('login error:', err.message);
     res.status(500).json({ message: 'Internal server error' });
@@ -704,11 +810,18 @@ app.put('/profile', authenticateToken, async (req, res) => {
   try {
     const { username, gender } = req.body;
     const userId = req.userId;
+    
     if (username) {
       const exists = await User.findOne({ username, _id: { $ne: userId } });
       if (exists) return res.status(409).json({ message: 'Username taken' });
     }
-    const updated = await User.findByIdAndUpdate(userId, { ...(username && { username }), ...(gender && { gender }) }, { new: true, runValidators: true }).select('-password -tokenVersion');
+    
+    const updated = await User.findByIdAndUpdate(
+      userId, 
+      { ...(username && { username }), ...(gender && { gender }) }, 
+      { new: true, runValidators: true }
+    ).select('-password -tokenVersion');
+    
     if (!updated) return res.status(404).json({ message: 'User not found' });
     res.json({ message: 'Profile updated', user: updated });
   } catch (err) {
@@ -717,16 +830,23 @@ app.put('/profile', authenticateToken, async (req, res) => {
   }
 });
 
-/* messages */
+// Messages
 app.post('/messages', authenticateToken, async (req, res) => {
   try {
     const { receiverId, text } = req.body;
     if (!receiverId || !text) return res.status(400).json({ message: 'Receiver and text required' });
+    
     const message = new Message({ sender: req.userId, receiver: receiverId, text });
     await message.save();
-    const populated = await message.populate([{ path: 'sender', select: 'username email' }, { path: 'receiver', select: 'username email' }]);
+    
+    const populated = await message.populate([
+      { path: 'sender', select: 'username email' }, 
+      { path: 'receiver', select: 'username email' }
+    ]);
+    
     const receiverSocketId = onlineUsers.get(receiverId);
     if (receiverSocketId) io.to(receiverSocketId).emit('receiveMessage', populated);
+    
     res.status(201).json(populated);
   } catch (err) {
     console.error('post /messages error:', err.message);
@@ -737,7 +857,16 @@ app.post('/messages', authenticateToken, async (req, res) => {
 app.get('/messages/:userId', authenticateToken, async (req, res) => {
   try {
     const other = req.params.userId;
-    const messages = await Message.find({ $or: [{ sender: req.userId, receiver: other }, { sender: other, receiver: req.userId }] }).sort({ createdAt: 1 }).populate('sender', 'username email').populate('receiver', 'username email');
+    const messages = await Message.find({ 
+      $or: [
+        { sender: req.userId, receiver: other }, 
+        { sender: other, receiver: req.userId }
+      ] 
+    })
+    .sort({ createdAt: 1 })
+    .populate('sender', 'username email')
+    .populate('receiver', 'username email');
+    
     res.json(messages);
   } catch (err) {
     console.error('get /messages error:', err.message);
@@ -757,13 +886,12 @@ app.get('/users', authenticateToken, async (req, res) => {
 
 /* ----------------------------- RANDOM CHAT ROUTES ----------------------------- */
 
-// Get random chat statistics
 app.get('/random-chat/stats', authenticateToken, async (req, res) => {
   try {
     const stats = {
       onlineUsers: onlineUsers.size,
       waitingUsers: waitingUsers.size,
-      activeRandomChats: activeRandomChats.size / 2, // Divide by 2 since each chat has 2 entries
+      activeRandomChats: activeRandomChats.size / 2,
       activeSessions: randomChatSessions.size
     };
     res.json(stats);
@@ -773,7 +901,6 @@ app.get('/random-chat/stats', authenticateToken, async (req, res) => {
   }
 });
 
-// Get user's random chat status
 app.get('/random-chat/status', authenticateToken, async (req, res) => {
   try {
     const userId = req.userId.toString();
@@ -798,7 +925,6 @@ app.get('/random-chat/status', authenticateToken, async (req, res) => {
   }
 });
 
-// Leave random chat
 app.post('/random-chat/leave', authenticateToken, async (req, res) => {
   try {
     const userId = req.userId.toString();
@@ -839,7 +965,11 @@ app.get('/health', async (req, res) => {
     status: dbState === 1 ? 'healthy' : 'unhealthy',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    database: { status: dbStates[dbState], host: mongoose.connection.host || 'not connected', name: mongoose.connection.name || 'not connected' },
+    database: { 
+      status: dbStates[dbState], 
+      host: mongoose.connection.host || 'not connected', 
+      name: mongoose.connection.name || 'not connected' 
+    },
     environment: process.env.NODE_ENV || 'development',
     onlineUsers: onlineUsers.size,
     activeCalls: activeCalls.size,
@@ -852,14 +982,36 @@ app.get('/health', async (req, res) => {
 });
 
 // 404 and error handlers
-app.use((req, res) => res.status(404).json({ message: 'Route not found', path: req.originalUrl }));
+app.use((req, res) => {
+  res.status(404).json({ 
+    message: 'Route not found', 
+    path: req.originalUrl 
+  });
+});
+
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err.stack);
-  res.status(500).json({ message: 'Something went wrong', ...(process.env.NODE_ENV === 'development' && { error: err.message }) });
+  res.status(500).json({ 
+    message: 'Something went wrong', 
+    ...(process.env.NODE_ENV === 'development' && { error: err.message }) 
+  });
 });
 
 /* ----------------------------- START SERVER ----------------------------- */
 const PORT = process.env.PORT || 5000;
+
+// Validate environment variables
+const requiredEnvVars = ['JWT_SECRET'];
+const missingEnvVars = requiredEnvVars.filter(envVar => !process.env[envVar]);
+
+if (missingEnvVars.length > 0) {
+  console.error('Missing required environment variables:', missingEnvVars);
+  process.exit(1);
+}
+
+if (process.env.JWT_SECRET === 'your-super-secret-jwt-key-change-this-in-production') {
+  console.warn('⚠️  WARNING: Using default JWT secret. This is insecure for production!');
+}
 
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
